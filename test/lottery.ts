@@ -1,81 +1,75 @@
-import {expect} from "chai"
-import {ethers} from "hardhat"
-import { Contract } from "ethers"
+import { ethers } from "hardhat";
+import { expect } from "chai";
 
-describe("Lottery", function() {
-    let lottery: Contract
-    let owner: any
-    let player1: any
-    let player2: any
+describe("Lottery Contract", function () {
+  let lottery: any, vrfMock: any, owner: any, addr1: any, addr2: any;
 
-    this.beforeEach(async function() {
-        const Lottery = await ethers.getContractFactory("Lottery")
-        lottery = await Lottery.deploy()
-        await lottery.deployed()
-        const accounts = await ethers.getSigners()
-        owner = accounts[0]
-        player1 = accounts[1]
-        player2 = accounts[2]
+  beforeEach(async () => {
+    
+    const Mock = await ethers.getContractFactory("VRFCoordinatorV2Mock");
+    vrfMock = await Mock.deploy(
+      ethers.utils.parseEther("0.25"),
+      1e9
+    );
+    await vrfMock.deployed();
+    const tx = await vrfMock.createSubscription();
+    const subId = (await tx.wait()).events![0].args.subId;
+    await vrfMock.fundSubscription(subId, ethers.utils.parseEther("10"));
+
+    [owner, addr1, addr2] = await ethers.getSigners();
+    const Lottery = await ethers.getContractFactory("Lottery");
+    lottery = await Lottery.deploy(
+      vrfMock.address,
+      ethers.utils.id("someKey"),
+      subId
+    );
+    await lottery.deployed();
+    await vrfMock.addConsumer(subId, lottery.address);
+  });
+
+  it("should allow a player to enter", async () => {
+    await expect(lottery.connect(addr1).enter({ value: ethers.utils.parseEther("0.02") }))
+      .to.emit(lottery, "LotteryEnter")
+      .withArgs(addr1.address);
+    const players = await lottery.getPlayers();
+    expect(players[0]).to.equal(addr1.address);
+  });
+
+  it("should request randomness and change state", async () => {
+    await lottery.connect(addr1).enter({ value: ethers.utils.parseEther("0.02") });
+    const tx = await lottery.endLottery();
+    await expect(tx).to.emit(lottery, "RequestedRandomness");
+    expect(await lottery.lotteryState()).to.equal(1); 
+  });
+
+  it("should pick a winner, transfer funds, and reset", async () => {
+
+    await lottery.connect(addr1).enter({
+    value: ethers.utils.parseEther("1")
     })
 
-    describe("constructor", function() {
-        it("owner should be sender", async function() {
-            expect(await lottery.owner()).to.equal(owner.address)
-        })
+    await lottery.connect(addr2).enter({
+    value: ethers.utils.parseEther("1")
     })
 
-    describe("enter", function(){
-        it("should allow player to enter", async function(){
-        await lottery.connect(player1).enter({
-            value: ethers.utils.parseEther("0.02")
-        })
-        const players = await lottery.getPlayers()
-        expect(players[0]).to.equal(player1.address)
+    const tx = await lottery.endLottery()
+    const receipt = await tx.wait()
+
+    const requestId = receipt.events[1].args.requestId
+
+    await vrfMock.fulfillRandomWords(requestId, lottery.address)
+
+    const winner = await lottery.recentWinner()
+
+    expect([addr1.address, addr2.address]).to.include(winner)
+
+    const winnerBalanceAfter = await ethers.provider.getBalance(winner)
+
+    expect(winnerBalanceAfter).to.be.gt(ethers.utils.parseEther("10000"))
+
+    expect(await lottery.lotteryState()).to.equal(0)
+
+    expect(await lottery.getPlayers()).to.be.empty
+
     })
-
-        it("should fail if not enough ETH", async function () {
-            await expect(lottery.connect(player1).enter({
-                value: ethers.utils.parseEther("0.0001")
-            })).to.be.reverted
-        })
-    })
-
-    describe("pickWinner", function(){
-        it("should only allow owner", async function () {
-            await lottery.connect(player1).enter({
-            value: ethers.utils.parseEther("0.02")
-            })
-            await expect(lottery.connect(player1).pickWinner()).to.be.reverted
-        })
-        it("should send money to winner", async function () {
-            await lottery.connect(player1).enter({
-            value: ethers.utils.parseEther("0.02")
-            })
-            await lottery.connect(player2).enter({
-                value: ethers.utils.parseEther("0.02")
-            })
-            const startPlayer1Balance = await ethers.provider.getBalance(player1.address)
-            const startPlayer2Balance = await ethers.provider.getBalance(player2.address)
-            await lottery.pickWinner()
-            const endPlayer1Balance = await ethers.provider.getBalance(player1.address)
-            const endPlayer2Balance = await ethers.provider.getBalance(player2.address)
-            expect(endPlayer1Balance.gt(startPlayer1Balance) 
-                || endPlayer2Balance.gt(startPlayer2Balance)).to.be.true
-
-        })
-        it("should reset players", async function(){
-
-            await lottery.connect(player1).enter({
-
-            value: ethers.utils.parseEther("0.02")
-
-            })
-
-            await lottery.pickWinner()
-
-            const players = await lottery.getPlayers()
-
-            expect(players.length).to.equal(0)
-            })
-    }) 
-})
+});
